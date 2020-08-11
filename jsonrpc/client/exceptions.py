@@ -3,24 +3,8 @@ Module containing exceptions raised by the JSON-RPC client.
 """
 
 
-class JsonRpcClientException(Exception):
+class TransportExhausted(RuntimeError):
     """
-    Base class for all JSON-RPC client exceptions.
+    Raised when the transport is exhausted, i.e. the receive async iterator
+    stops, before a request is resolved with a corresponding response.
     """
-
-
-class InvalidRequest(JsonRpcClientException):
-    """
-    Raised when there is an error with the way a request is constructed.
-    """
-
-
-class MethodExecutionError(JsonRpcClientException):
-    """
-    Raised when there is an error executing a JSON-RPC method on the server.
-    """
-    def __init__(self, code, message, data):
-        self.code = code
-        self.message = message
-        self.data = data
-        super().__init__(self.message)

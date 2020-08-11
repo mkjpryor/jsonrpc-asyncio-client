@@ -1,88 +1,17 @@
 """
-Module containing the base implementation for JSON-RPC clients.
+Module containing the JSON-RPC client.
 """
 
 import asyncio
 import functools
 import json
-import uuid
+import warnings
 
-from .exceptions import InvalidRequest, MethodExecutionError
+from pydantic import ValidationError
 
+from jsonrpc.model import Request, BatchRequest, Response
 
-class Request:
-    """
-    Represents a JSON-RPC request.
-    """
-    def __init__(self, method, *args, _notification = False, **kwargs):
-        # The params can be *either* positional or keyword
-        if args and kwargs:
-            raise InvalidRequest('Positional and keyword arguments are mutually exclusive.')
-        # Unless we are a notification, generate an id
-        self.id = str(uuid.uuid4()) if not _notification else None
-        self.method = method
-        self.params = args or kwargs
-
-    @property
-    def is_notification(self):
-        """
-        Indicates if the request is a notification.
-        """
-        return not self.id
-
-    def as_dict(self):
-        """
-        Convert this request to a dict.
-        """
-        result = dict(jsonrpc = "2.0", method = self.method)
-        if self.params:
-            result.update(params = self.params)
-        if self.id:
-            result.update(id = self.id)
-        return result
-
-    def as_json(self, **kwargs):
-        """
-        Return a JSON representation of this request.
-        """
-        return json.dumps(self.as_dict(), **kwargs)
-
-
-class Notification(Request):
-    """
-    Represents a JSON-RPC notification.
-    """
-    def __init__(self, method, *args, **kwargs):
-        super().__init__(method, *args, _notification = True, **kwargs)
-
-
-class BatchRequest:
-    """
-    Represents a JSON-RPC batch request.
-    """
-    def __init__(self, *requests):
-        # The batch must have at least one request
-        if not requests:
-            raise InvalidRequest('Batch must have at least one request.')
-        self.requests = tuple(requests)
-
-    def __len__(self):
-        return len(self.requests)
-
-    def __iter__(self):
-        return iter(self.requests)
-
-    def as_list(self):
-        """
-        Convert this batch request to a list of request dictionaries.
-        """
-        return [r.as_dict() for r in self.requests]
-
-    def as_json(self, **kwargs):
-        """
-        Return a JSON representation of this batch request.
-        """
-        return json.dumps(self.as_list(), **kwargs)
+from .exceptions import TransportExhausted
 
 
 class Client:
@@ -101,20 +30,20 @@ class Client:
         """
         Calls the given JSON-RPC method with the given arguments and returns the result.
         """
-        return (await self.send(Request(method, *args, **kwargs)))
+        return (await self.send(Request.create(method, *args, **kwargs)))
 
     async def notify(self, method, *args, **kwargs):
         """
         Notifies the given JSON-RPC method with the given arguments.
         """
-        return (await self.send(Notification(method, *args, **kwargs)))
+        return (await self.send(Request.create(method, *args, _notification = True, **kwargs)))
 
     async def batch(self, *requests):
         """
         Sends a batch of JSON-RPC requests and returns a list of the results in the
         same order as the requests.
         """
-        return (await self.send(BatchRequest(*requests)))
+        return (await self.send(BatchRequest.create(*requests)))
 
     def __getattr__(self, name):
         """
@@ -138,35 +67,51 @@ class Client:
     async def _listen(self):
         """
         Listen for responses from the transport and handle them as appropriate.
+
+        Error conditions that cannot be associated with a request, such as badly-formed
+        JSON or invalid responses, are emitted as warnings.
+
+        This is because we do not want to allow these conditions to raise as this would
+        cause the listen task to exit and render the client unable to process future requests.
+
+        Python can be configured to raise on warnings if this is the desired behaviour, i.e.
+        if the client is sending one request at a time.
         """
         async for response_data in self.transport.receive():
             if not response_data:
-                return
-            # Get a list of responses from the response data
-            responses = json.loads(response_data)
+                continue
+            try:
+                responses = json.loads(response_data)
+            except json.decoder.JSONDecodeError:
+                warnings.warn('received invalid JSON', RuntimeWarning)
+                continue
             if not isinstance(responses, list):
                 responses = [responses]
             # Process each response to get either a result or error
-            for response in responses:
-                # If the response doesn't have an id, there is nothing to do
-                response_id = response.get('id')
-                if not response_id:
-                    return
+            for response_obj in responses:
+                # Check if the received object is a valid response
+                try:
+                    response = Response.parse_obj(response_obj)
+                except ValidationError:
+                    warnings.warn('received invalid JSON-RPC response', RuntimeWarning)
+                    continue
+                # If the response doesn't have an id, emit a warning
+                # Note that it must be an error because the response model prevents a response
+                # from being created with a result and a null id, as this would be a
+                # notification and hence no response should be produced
+                if not response.id:
+                    warnings.warn(repr(response.error.exception()), RuntimeWarning)
+                    continue
                 # Get the corresponding future
                 try:
-                    future = self._futures.pop(response_id)
+                    future = self._futures.pop(response.id)
                 except KeyError:
                     continue
                 # Resolve the future either with a result or an exception
-                if 'error' in response:
-                    error = MethodExecutionError(
-                        code = response['error']['code'],
-                        message = response['error']['message'],
-                        data = response['error'].get('data')
-                    )
-                    future.set_exception(error)
+                if response.error:
+                    future.set_exception(response.error.exception())
                 else:
-                    future.set_result(response.get('result'))
+                    future.set_result(response.result)
 
     async def send(self, request):
         """
@@ -185,10 +130,24 @@ class Client:
             futures = [self._make_future(r) for r in request]
             result = asyncio.gather(*futures, return_exceptions = True)
         # Serialize the request using JSON and send it
-        request_data = request.as_json(cls = self.json_encoder)
+        request_data = request.json(cls = self.json_encoder)
         await self.transport.send(request_data, 'application/json')
         # Wait for the futures to be resolved
-        return await result
+        # If the listen task exits, we also want to stop waiting for the result
+        done, pending = await asyncio.wait(
+            [result, self._listen_task],
+            return_when = asyncio.FIRST_COMPLETED
+        )
+        if result in done:
+            # If the result future is in the completed tasks, get the result
+            # If it resolved with an exception, this will raise
+            return result.result()
+        else:
+            # If the task that completed was the listen, we want to raise an error
+            # This can be either the error that the listen exited with or transport exhausted
+            # if the async iterator exited without an error
+            self._listen_task.result()
+            raise TransportExhausted()
 
     async def close(self):
         """
