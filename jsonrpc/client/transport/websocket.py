@@ -15,10 +15,17 @@ class Transport(BaseTransport):
     """
     Websocket transport for a JSON-RPC client.
     """
+    # Use a 16MB max message size by default, the same as hypercorn
+    # The default is 1MB
+    WEBSOCKET_MAX_SIZE_BYTES = 16 * 1024 * 1024
+
     def __init__(self, endpoint, **connect_kwargs):
         super().__init__()
-        self.connect = websockets.connect(endpoint, **connect_kwargs)
-        self._client = None
+        self.connect = websockets.connect(
+            endpoint,
+            max_size = self.WEBSOCKET_MAX_SIZE_BYTES,
+            **connect_kwargs
+        )
         async def _client():
             return await self.connect
         self.client = asyncio.create_task(_client())
